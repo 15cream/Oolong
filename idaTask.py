@@ -429,6 +429,12 @@ class MachO:
                 new = args[idx]
                 if new and type(new) is str and Message.is_rec_decidable(new):
                     new_func_type.append(new)
+                elif new and type(new) is ida_hexrays.lvar_t:
+                    tif = new.tif.__str__()
+                    if Message.is_rec_decidable(tif):
+                        new_func_type.append(tif)
+                    else:
+                        new_func_type.append(0L)
                 else:
                     new_func_type.append(0L)
             MachO.updated_func_args[fi] = new_func_type
@@ -719,10 +725,7 @@ class Block:
             block = Block(subroutine, block_args, block_vars, frm_func=f)
             if call_type == 'GCD':
                 CG.sharedCG.add_edge(ida_funcs.get_func(callsite).startEA, subroutine, callsite, 'GCD', block=block)
-            # f = Func(subroutine)
-            # f.decompile()
-            # f.resolve_cfunc()
-            # Func.analyzed_subroutines.append(subroutine)
+            f = Func.analyze(subroutine)
             return subroutine
 
     @staticmethod
@@ -1235,7 +1238,7 @@ class Func:
                 lvalue.tif = ret_type
                 cexpr_t.y.tif = ret_type
         elif lvalue.opname == 'obj':
-            if idc.SegName(lvalue.obj_ea) == '__bss':
+            if idc.SegName(lvalue.obj_ea) in ['__bss', '__common']:
                 if lvalue.obj_ea not in MachO.bss_data and ret_type:
                     MachO.bss_data[lvalue.obj_ea] = ret_type
             else:
@@ -1391,7 +1394,7 @@ class Func:
             return "{}_meta *".format(idc.Name(obj_ea).split('_OBJC_CLASS_$_')[-1])
         elif segName == '__const':
             return obj_ea
-        elif segName == '__bss':
+        elif segName in ['__bss', '__common']:
             return MachO.query_bss(obj_ea) or 'id'  # TODO  or return id?
 
     def resolve_arc_val(self, ea, call, args):
@@ -1648,6 +1651,13 @@ class TR:
 
         ret = set()
         if tainted:
+            # for var in tainted:
+            #     if var in f.lvars:
+            #         for usage in f.lvars[var]:
+            #             if usage.ea in CG.sharedCG.edges:
+            #                 des = CG.sharedCG.edges[usage.ea][0][1]
+            #                 if type(des) is str:
+            #                     print '!!!Test', hex(usage.ea), usage.name, des
             if self.to_list:
                 # self.to is the function which the tainted data passed to
                 for to in self.to_list:
@@ -1753,7 +1763,7 @@ class TA:
                         sinked_path.append(sink_p)
             if sinked_path:
                 Utils.log('Find sensitive paths, the details as follows: ')
-                print 'SS_API to src: ', src_p
+                print 'SS_API to src: ', src_p.pprint()
                 print 'SS_API to sink: ', len(sinked_path)
                 for p in sinked_path:
                     p.pprint()
@@ -1820,12 +1830,12 @@ class SS_API:
 
     def pprint(self):
         print 'SS-API: {} ({})'.format(self.node, self.source)
-        print 'to SINKs: '
-        for path in self.to_sink:
-            path.pprint()
-        print 'to SRCs: '
-        for path in self.to_src:
-            path.pprint()
+        # print 'to SINKs: '
+        # for path in self.to_sink:
+        #     path.pprint()
+        # print 'to SRCs: '
+        # for path in self.to_src:
+        #     path.pprint()
 
 
 class Path:
