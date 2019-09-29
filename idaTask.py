@@ -1,3 +1,5 @@
+# coding=utf-8
+
 import os
 import re
 import time
@@ -13,9 +15,16 @@ import ida_hexrays
 import ida_xref
 import ida_gdl
 
+ERROR = dict()
+memptr = []
+miss_arg = dict()
+blr = []
+helper = []
 case_1 = []
 ptr_arg = []
 INVALID_EA = 0xffffffffffffffffL
+USELESS_TYPES = ['id', 'void *', 'void **', 'struct objc_object *', '__int64', 'char *', '_QWORD *', '_QWORD',
+                 'const char *']
 execute_block_through_timer = ['scheduledTimerWithTimeInterval:repeats:block:',
                                'timerWithTimeInterval:repeats:block:',
                                'initWithFireDate:interval:repeats:block:', ]
@@ -26,6 +35,16 @@ execute_invocation_through_timer = ['scheduledTimerWithTimeInterval:invocation:r
 dispatch_msg_in_timer = ['scheduledTimerWithTimeInterval:target:selector:userInfo:repeats:',
                          'timerWithTimeInterval:target:selector:userInfo:repeats:',
                          'initWithFireDate:interval:target:selector:userInfo:repeats:', ]
+
+ptypes = {
+    'B': 'bool',
+    'Q': '__int64',  # unsigned __int64
+    'I': '__int64',  # unsigned int
+    'i': '__int64',  # int
+    'q': '__int64',  # signed __int64
+
+
+}
 
 # NOP : 1F 20 03 D5
 # MOV X0, X0 : E0 03 00 AA
@@ -59,6 +78,9 @@ stop_words = ['NS_AVAILABLE', 'NS_DEPRECATED', 'NS_DESIGNATED_INITIALIZER', '__O
 cdecls = {'_dispatch_async': 'void dispatch_once(void *a1, void *a2);',  # void dispatch_async(dispatch_queue_t queue, dispatch_block_t block);
           '_dispatch_once': 'void dispatch_once(void *a1, void *a2);',  # void dispatch_once(dispatch_once_t *predicate, dispatch_block_t block);
           '_dispatch_sync': 'void dispatch_once(void *a1, void *a2);',  # void dispatch_sync(dispatch_queue_t queue, dispatch_block_t block);
+          '_objc_retainAutoreleaseReturnValue': '__int64 __fastcall objc_retainAutoreleaseReturnValue(__int64 a1);',
+          '_objc_retain': '__int64 __fastcall objc_retain(__int64 a1);',
+          '_objc_release': 'void __fastcall objc_release(void *a1);',
           }
 
 log_on = True
@@ -325,12 +347,16 @@ class Frameworks:
 class MachO:
     funcs_index_by_sel = dict()
     funcs_index_by_rec = dict()
+
     subroutines = []
+    oc_methods = []
+
+    funcs_need_calc = []  # calc the ret value (oc method)
+    func_with_no_args = []
+
     func_data = dict()
     updated_func_ret = dict()
     updated_func_args = dict()
-    funcs_need_calc = []
-    func_with_no_args = []
     bss_data = dict()
 
     def __init__(self):
@@ -342,22 +368,27 @@ class MachO:
         for f in Functions(start=seg.startEA, end=seg.endEA):
             name = GetFunctionName(f)
             CG.sharedCG.add_node(f, name)
-            if name[0] not in ['-', '+']:
-                if name.startswith('sub_'):
-                    MachO.subroutines.append(f)
-                continue
-            cls, sel = name[1:].strip('[]').split()
+            if name[0] in ['-', '+']:
+                MachO.oc_methods.append(f)
+            elif name.startswith('sub_'):
+                MachO.subroutines.append(f)
+
             func_type = MachO.get_func_type(f)
+            # may fail to get func_type (func_type may be complicated, leave it alone for the moment)
             if func_type:
                 MachO.func_data[f] = func_type
-                rec = func_type[0].type.__str__()
-                MachO.add(rec, sel, f)
-                if len(func_type) == 2:
-                    MachO.func_with_no_args.append(f)
-                ret_type = func_type.rettype.__str__()
-                if ret_type == 'id' and cls in OCClass.cls_dict:  # TODO category
-                    if not OCClass.cls_dict[cls].is_method_a_getter(sel, f):
-                        MachO.funcs_need_calc.append(f)
+                if f in MachO.oc_methods:
+                    cls, sel = name[1:].strip('[]').split()
+                    rec = func_type[0].type.__str__()
+                    MachO.add(rec, sel, f)
+
+                    if len(func_type) == 2:
+                        MachO.func_with_no_args.append(f)
+
+                    ret_type = func_type.rettype.__str__()
+                    if ret_type == 'id' and cls in OCClass.cls_dict:  # TODO category
+                        if not OCClass.cls_dict[cls].is_method_a_getter(sel, f):
+                            MachO.funcs_need_calc.append(f)
 
         seg = ida_segment.get_segm_by_name('__stubs')
         for f in Functions(start=seg.startEA, end=seg.endEA):
@@ -365,6 +396,15 @@ class MachO:
             if name in cdecls:
                 print 'change the cdecl, ', name
                 ida_typeinf.apply_cdecl(idaapi.til_t(), f, cdecls[name])
+
+    @staticmethod
+    def query_ivar(base, offset):
+        if type(offset) is long and type(base) is str:
+            offset *= 8
+            if MachO.is_rec_decidable(base):
+                cls = OCClass.cls_dict[Utils.nice_str(base)]
+                if offset in cls.ivars:
+                    return cls.ivars[offset]
 
     @staticmethod
     def get_func_type(f_start):
@@ -412,32 +452,39 @@ class MachO:
 
     @staticmethod
     def update_func_data_and_analyze(fi, args, frm=None, a=None):
+        # 按理说，如果fi已经完成分析，那么更新func_data是没有意义的
+        if fi in Func.pool:
+            return
         MachO.update_func_data(fi, args, frm=frm, a=a)
-        # TODO could we directly use the a (to replace the local vars of cfunc_t)?
         Func.analyze(fi)
 
     @staticmethod
     def update_func_data(fi, args, frm=None, a=None):
-        new_func_type = []
-        if fi not in MachO.func_data:
-            return  # Failed to get func_type (func_type may be complicated, leave it alone for the moment)
-        ori_func_type = MachO.func_data[fi]
-        argc = len(ori_func_type) - 2  # the first two are rec and sel
-        if argc and len(args) >= argc:
-            for idx in range(0, argc):
-                ori = ori_func_type[idx+2].type.__str__()
-                new = args[idx]
-                if new and type(new) is str and Message.is_rec_decidable(new):
-                    new_func_type.append(new)
-                elif new and type(new) is ida_hexrays.lvar_t:
-                    tif = new.tif.__str__()
-                    if Message.is_rec_decidable(tif):
-                        new_func_type.append(tif)
-                    else:
-                        new_func_type.append(0L)
-                else:
-                    new_func_type.append(0L)
-            MachO.updated_func_args[fi] = new_func_type
+        # 所有的func_data更新都在这里发生，包括Block类型的参数。但具体的block数据需要与caller的调用信息对应起来
+        # 根据frm（oc_method以及subroutine都会传入frm），可以查询到frm（callsite）处是否使用了block以及具体使用的block
+        # 因为仅仅根据arg的类型只能判断该对象为block，却无法获知block的数据。
+        new_func_type = []  # 0L表示不对原参数类型做变动
+        if fi in MachO.oc_methods:
+            new_func_type = [0L, 0L]  # 前两个参数为rec、sel，不用做变动
+
+        for idx in range(0, len(args)):
+            arg = args[idx]
+            new_type = arg.tif.__str__() if type(arg) is ida_hexrays.lvar_t else arg
+            if type(new_type) is str:
+                if MachO.is_rec_decidable(new_type):
+                    pass
+                elif 'NSConcrete' in new_type and frm:
+                    block = Block.usage[(frm, idx)] if (frm, idx) in Block.usage else None
+                    if block:
+                        pass  # todo
+            else:
+                new_type = 0L  # 暂时不支持该参数的类型更新
+            new_func_type.append(new_type)
+        if len(set(new_func_type)) == 1 and 0L in new_func_type:
+            pass
+        else:
+            print 'UPDATE {} from {}: {}'.format(fi, frm, new_func_type)
+        MachO.updated_func_args[fi] = new_func_type
 
     @staticmethod
     def guess(sel, rec=None):
@@ -505,16 +552,27 @@ class MachO:
                     stores.append(xref.frm)
             for def_ea in stores:
                 f = Func.analyze(idaapi.get_func(def_ea).startEA)
-                if data_ea in MachO.bss_data:  # asg expr during resolve_cfunc
+                if data_ea in MachO.bss_data:  # 在上述解析过程中通过赋值语句获得bss_data
                     break
                 else:
-                    val = f.resolve_def(def_ea)
+                    # val = f.resolve_def(def_ea=def_ea)
+                    val = f.def_analysis(def_ea, idc.GetOpnd(def_ea, 0))
                     if val:
                         MachO.bss_data[data_ea] = val
                         break
-            if data_ea not in MachO.bss_data:
-                MachO.bss_data[data_ea] = idc.Name(data_ea)  # or id
+            if data_ea not in MachO.bss_data:  # 如果通过解析仍然没有获得bss_data的值，那么返回
+                MachO.bss_data[data_ea] = idc.Name(data_ea) or 'id'
         return MachO.bss_data[data_ea]
+
+    @staticmethod
+    def is_rec_decidable(rec_type):
+        if rec_type:
+            nice_str = Utils.nice_str(rec_type)
+            if nice_str in OCClass.cls_dict:
+                return True
+            if nice_str in Frameworks.cls_dict:
+                return True
+        return False
 
 # -----------------------------Protocol----------------------------------------------------
 
@@ -591,6 +649,7 @@ class OCClass:
         self.classref = None
         self.superref = None
         self.prots = []
+        self.ivars = dict()
 
         for xref in XrefsTo(ea):
             frm = xref.frm
@@ -598,6 +657,18 @@ class OCClass:
                 self.classref = frm
             if idc.SegName(frm) == '__objc_superrefs':
                 self.superref = frm
+
+        base_ivars = ida_bytes.get_qword(self.info + 0x30)
+        if base_ivars and idc.SegName(base_ivars) == '__objc_const':
+            entrysize = ida_bytes.get_dword(base_ivars)
+            count = ida_bytes.get_dword(base_ivars + 4)
+            ea = base_ivars + 8
+            for i in range(count):
+                offset = ida_bytes.get_dword(idc.get_qword(ea))
+                _type = idc.get_bytes(idc.Qword(ea + 0X10), idc.get_item_size(idc.Qword(ea + 0X10)) - 1)
+                self.ivars[offset] = _type
+                # print offset, _type, self.name
+                ea += entrysize
 
         base_prots = ida_bytes.get_qword(self.info + 0x28)
         if base_prots and idc.SegName(base_prots) == '__objc_const':
@@ -673,7 +744,8 @@ class Block:
                              '_dispatch_semaphore_wait', '_dispatch_semaphore_signal',
                              '_dispatch_time']
 
-    pool = dict()
+    pool = dict()  # {block_func_ptr: block}
+    usage = dict()  # {callsite: block which is used as the argument of the call at this callsite}
 
     def __init__(self, ea, args, vars, frm_func=None):
         self.start_ea = ea
@@ -696,24 +768,28 @@ class Block:
         block_vars = []
         # start = 0 if call_type == 'GCD' else 2
 
-        for arg in args:
+        for idx in range(0, len(args)):
+            arg = args[idx]
             if type(arg) is long and idc.Name(idc.Qword(arg)) == '__NSConcreteGlobalBlock':
                 subroutine = idc.Qword(arg + 0x10)
-                break
             elif type(arg) is ida_hexrays.lvar_t and arg.tif.__str__() == 'NSConcreteStackBlock **':
-                base = arg.location.stkoff()
-                subroutine_var = lvars_t[lvars_t.find_stkvar(base + 0x10, 64)]
-                subroutine = f.cfunc_t.eamap[subroutine_var.defea / 4 * 4][
-                    0].details.y.obj_ea if subroutine_var.is_stk_var() else None
-                for idx in range(0, 3):
-                    stkoff = base + 0x20 + idx*8
-                    if lvars_t.find_stkvar(stkoff, 64) != -1:
-                        block_arg = lvars_t[lvars_t.find_stkvar(stkoff, 64)]
-                        if type(block_arg) is ida_hexrays.lvar_t:
-                            block_vars.append(block_arg)
-                            block_args.append(block_arg.tif.__str__())
-                    # TODO v27 = *(_QWORD *)(v4 + 32); sub_10000E1A0, CPUDasher
-                break
+                try:
+                    base = arg.location.stkoff()
+                    subroutine_var = lvars_t[lvars_t.find_stkvar(base + 0x10, 64)]
+                    defea = subroutine_var.defea / 4 * 4
+                    subroutine = f.cfunc_t.eamap[defea][0].details.y.obj_ea if subroutine_var.is_stk_var() else None
+                    for idx in range(0, 3):
+                        stkoff = base + 0x20 + idx*8
+                        if lvars_t.find_stkvar(stkoff, 64) != -1:
+                            block_arg = lvars_t[lvars_t.find_stkvar(stkoff, 64)]
+                            if type(block_arg) is ida_hexrays.lvar_t:
+                                block_vars.append(block_arg)
+                                block_args.append(block_arg.tif.__str__())
+                                block_args.append(f.get_var_type(block_arg))
+                        # TODO v27 = *(_QWORD *)(v4 + 32); sub_10000E1A0, CPUDasher
+                except Exception as e:
+                    print 'FAIL TO RESOLVE BLOCK', hex(callsite), call
+                    return None
             elif type(arg) is str and arg.startswith('sub_'):  # dispatch_once_f
                 try:
                     subroutine = int(arg.split('sub_')[1], 16)
@@ -721,12 +797,15 @@ class Block:
                 except Exception as e:
                     pass
 
-        if subroutine in MachO.subroutines:
-            block = Block(subroutine, block_args, block_vars, frm_func=f)
-            if call_type == 'GCD':
-                CG.sharedCG.add_edge(ida_funcs.get_func(callsite).startEA, subroutine, callsite, 'GCD', block=block)
-            f = Func.analyze(subroutine)
-            return subroutine
+            if subroutine in MachO.subroutines:
+                block = Block(subroutine, block_args, block_vars, frm_func=f)
+                if call_type == 'GCD':
+                    CG.sharedCG.add_edge(ida_funcs.get_func(callsite).startEA, subroutine, callsite, 'GCD', block=block)
+                else:
+                    Block.usage[(callsite, idx)] = block
+                f = Func.analyze(subroutine)
+
+        return subroutine
 
     @staticmethod
     def update_var_tif_if_needed(var, cfunc_t):
@@ -767,14 +846,21 @@ class Message:
         self.ctx = ida_funcs.get_func(self.callsite).startEA
         self.a = args
         self.cargs = f.resolve_args(args, 0, callsite, 'arg')
-        self.rec = rec or self.cargs[0]
-        self.sel = sel or self.cargs[1]
-        self.args = self.cargs[2:]
+
+        if len(self.cargs) > 1:
+            self.rec = rec or self.cargs[0]
+            self.sel = sel or self.cargs[1]
+            self.args = self.cargs[2:]
+        else:
+            self.rec = None
+            self.sel = None
+            self.args = []
+            print 'ERROR 789,', hex(callsite)
+
         self.details = ''
 
     def resolve_sel_succeed(self):
         if type(self.sel) is ida_hexrays.lvar_t:
-            # self.sel = self.f.resolve_def(self.sel.defea) or self.f.def_analysis(self.callsite, 'X1')
             self.sel = self.f.get_var_type(self.sel) or self.f.def_analysis(self.callsite, 'X1')
         if not self.sel or type(self.sel) is not str:
             print 'unidentified sel ', hex(self.callsite), self.sel
@@ -783,7 +869,6 @@ class Message:
         if self.sel.startswith('performSelector:onTarget:'):
             pass  # TODO CASE 6
         elif self.sel.startswith('performSelector') and self.args:
-            # virtual_sel = self.f.resolve_arg(self.args[2], self.callsite, 2, 'sel')
             virtual_sel = self.args[0]
             if type(virtual_sel) is str:
                 self.sel = virtual_sel
@@ -806,8 +891,10 @@ class Message:
             rec_type = self.f.get_var_type(self.rec)
         else:
             print 'unidentified rec ', hex(self.callsite), self.rec
-            return rec_type
-        if self.call == '_objc_msgSendSuper2':
+        if not MachO.is_rec_decidable(rec_type):
+            rec_type = self.f.def_analysis(self.callsite, 'X0') or rec_type
+
+        if MachO.is_rec_decidable(rec_type) and self.call == '_objc_msgSendSuper2':
             if self.sel.startswith('init'):
                 return rec_type
             pretty_rec = Utils.nice_str(rec_type)
@@ -824,7 +911,7 @@ class Message:
         rec_type = self.resolve_rec()
         # print '!!!', rec_type, self.sel, target, ret_type, inferred_rec
 
-        if Message.is_rec_decidable(rec_type):  # simply query
+        if MachO.is_rec_decidable(rec_type):  # simply query
             target, ret_type = MachO.query_msg_handler(self.sel, rec_type)
         else:  # could be None or invalid: void * , id, ...   we need to guess
             target, ret_type, inferred_rec = MachO.guess(self.sel, rec=rec_type)
@@ -842,32 +929,33 @@ class Message:
             msg_type = None
             rec_type = inferred_rec or rec_type
             if ret_type:
-                if Message.is_rec_decidable(rec_type):
+                if MachO.is_rec_decidable(rec_type):
                     msg_type = 'E_MSG'  # framework message
                 else:
                     msg_type = 'U_MSG'  # inferred the ret_val according to the sel, but still don't know the receiver.
             else:
                 # void * alloc
-                if Message.is_rec_decidable(rec_type):
+                if MachO.is_rec_decidable(rec_type):
                     msg_type = 'X_MSG'
                 else:
                     msg_type = 'B_MSG'
                     print 'Invalid rec, ', rec_type, self.sel, hex(self.callsite)
 
             pt_rec = Utils.nice_str(rec_type)
-            self.analyze_msg(pt_rec)
+            ret_type = self.analyze_msg(pt_rec) or ret_type
+
             if msg_type:
                 CG.sharedCG.add_edge(self.ctx, '[{} {}]'.format(pt_rec, self.sel), self.callsite, msg_type,
                                      details=self.details, message=self)
         # ret_type adjustment
         if self.sel in ['class', 'init']:
-            ret_type = rec_type if Message.is_rec_decidable(rec_type) else ret_type
+            ret_type = rec_type if MachO.is_rec_decidable(rec_type) else ret_type
         elif self.sel == 'isKindOfClass:':
             ret_type = 'BOOL'
-        elif self.sel == 'alloc' and Message.is_rec_decidable(rec_type):  # the ori ret_type is id
+        elif self.sel == 'alloc' and MachO.is_rec_decidable(rec_type):  # the ori ret_type is id
             ret_type = '{} *'.format(rec_type.split('_meta *')[0]) if '_meta *' in rec_type else rec_type
 
-        if ret_type == 'instancetype' and Message.is_rec_decidable(rec_type):
+        if ret_type == 'instancetype' and MachO.is_rec_decidable(rec_type):
             ret_type = '{} *'.format(Utils.nice_str(rec_type))
         elif ret_type == 'BOOL':
             ret_type = ret_type.lower()
@@ -877,63 +965,65 @@ class Message:
     def analyze_msg(self, rec_type):
         if not rec_type:
             return None
-        if 'NSUserDefaults' in rec_type and self.sel == 'objectForKey:':
-            self.details += '; key_{}'.format(self.args[0] if len(self.args) > 0 else None)
 
-    # def resolve_nested_message(self):
-    #     target = None
-    #     # ------------NSTimer----------------------------------
-    #     # Add an edge from the callsite to the resolved target.
-    #     # Skip this message if failed to resolve the target.
-    #     # Target is a block
-    #     if self.sel in execute_block_through_timer:
-    #         block = self.args[-1]
-    #
-    #     # Target is a NSInvocation
-    #     if self.sel in execute_invocation_through_timer:
-    #         invocation = self.args[1]
-    #
-    #     # Target is a message
-    #     if self.sel in dispatch_msg_in_timer:
-    #         msg = Message(self.callsite, rec=self.args[1], sel=self.args[2])
-    #         msg.resolve_target()
-    #
-    #     # --------------NSNotification-------------------------
-    #     if self.sel is 'addObserverForName:object:queue:usingBlock:':
-    #         block = self.args[3]
-    #         NSNotificationCenter.add(self.args[0], block=self.args[-1])
-    #         return
-    #     if self.sel is 'addObserver:selector:name:object:':
-    #         msg = Message(self.callsite, rec=self.args[0], sel=self.args[1])
-    #         msg.resolve_target()
-    #         NSNotificationCenter.add(self.args[2], msg=msg)
-    #         return
-    #     if self.sel is 'postNotificationName:object:userInfo:' or 'postNotificationName:object:':
-    #         name = self.args[0]
-    #     elif self.sel is 'postNotification:':
-    #         # TODO
-    #         pass
-    #     target = NSNotificationCenter.retrieve(name)
-    #
-    #     # ------------------NSOperation---------------------------------
-    #     if self.sel is 'addOperation:' or 'addOperations:waitUntilFinished:':
-    #         operation = self.args[0]
-    #     # TODO: check the type of operation and find target
-    #     # non-concurrent operations, main method
-    #
-    #     # concurrent operations, start method
-    #     elif self.sel is 'addOperationWithBlock:':
-    #         block = self.args[0]
+        # ---------- NSUserDefaults ----------------------------
+        if 'NSUserDefaults' in rec_type:
+            key, data = None, None
+            if self.sel == 'objectForKey:':
+                key = self.f.get_var_type(self.args[0]) if type(self.args[0]) is ida_hexrays.lvar_t else self.args[0]
+            elif self.sel == 'setObject:forKey:' and len(self.args) > 1:
+                data = self.f.get_var_type(self.args[0]) if type(self.args[0]) is ida_hexrays.lvar_t else self.args[0]
+                key = self.f.get_var_type(self.args[1]) if type(self.args[1]) is ida_hexrays.lvar_t else self.args[1]
+            if key:
+                NSUserdefaults.shared.add_invoke(key, self.callsite, data=data)
+                if not data:
+                    return NSUserdefaults.shared.get_data(key)
+            # self.details += '; key_{}'.format(self.args[0] if len(self.args) > 0 else None)
 
-    @staticmethod
-    def is_rec_decidable(rec_type):
-        if rec_type:
-            nice_str = Utils.nice_str(rec_type)
-            if nice_str in OCClass.cls_dict:
-                return True
-            if nice_str in Frameworks.cls_dict:
-                return True
-        return False
+        # ------------NSTimer----------------------------------
+        # Add an edge from the callsite to the resolved target.
+        # Skip this message if failed to resolve the target.
+
+        # Target is a block
+        # if self.sel in execute_block_through_timer and len(self.args) > 0:
+        #     if (self.callsite, len(self.args)-1) in Block.usage:
+        #         block = Block.usage[(self.callsite, len(self.args)-1)]
+        #
+        # # Target is a NSInvocation
+        # if self.sel in execute_invocation_through_timer and len(self.args) > 1:
+        #     invocation = self.args[1]
+        #
+        # # Target is a message
+        # if self.sel in dispatch_msg_in_timer and len(self.args) > 4:
+        #     msg = Message(self.callsite, rec=self.args[-4], sel=self.args[-3])
+        #     msg.dynamic_bind()
+        #
+        # # --------------NSNotification-------------------------
+        # if self.sel is 'addObserverForName:object:queue:usingBlock:':
+        #     block = self.args[3]
+        #     NSNotificationCenter.add(self.args[0], block=self.args[-1])
+        #     return
+        # if self.sel is 'addObserver:selector:name:object:':
+        #     msg = Message(self.callsite, rec=self.args[0], sel=self.args[1])
+        #     msg.resolve_target()
+        #     NSNotificationCenter.add(self.args[2], msg=msg)
+        #     return
+        # if self.sel is 'postNotificationName:object:userInfo:' or 'postNotificationName:object:':
+        #     name = self.args[0]
+        # elif self.sel is 'postNotification:':
+        #     # TODO
+        #     pass
+        # target = NSNotificationCenter.retrieve(name)
+        #
+        # # ------------------NSOperation---------------------------------
+        # if self.sel is 'addOperation:' or 'addOperations:waitUntilFinished:':
+        #     operation = self.args[0]
+        # # TODO: check the type of operation and find target
+        # # non-concurrent operations, main method
+        #
+        # # concurrent operations, start method
+        # elif self.sel is 'addOperationWithBlock:':
+        #     block = self.args[0]
 
 
 class NSNotificationCenter:
@@ -1037,7 +1127,7 @@ class Func:
     def __init__(self, start_ea):
         self.start_ea = start_ea  # cfunc.entry_ea
         self.cfunc_t = None
-        self.dcl = None  # cfunc.print_dcl()
+        self.call_and_ret = dict()
         self.ret = []  # possible return types
         self.ret_vars = []
         self.ret_ea = []
@@ -1059,26 +1149,13 @@ class Func:
             return Func.pool[f]
         func = Func(f)
         func.decompile()
-        func.init_state()
-        func.resolve_cfunc()
+        try:
+            if func.cfunc_t:
+                func.init_state()
+                func.resolve_cfunc()
+        except Exception as e:
+            print '!!!', e
         return func
-
-    @staticmethod
-    def decompile_all(count=None):
-        print 'START: ', time.asctime(time.localtime(time.time()))
-        idx = 0
-        for f in Functions():
-            if idc.GetFunctionName(f)[0] not in ['-', '+']:
-                continue
-            Func.analyze(f)
-            if count and idx > count:
-                break
-            idx += 1
-        for sub in MachO.subroutines:
-            if sub not in Func.analyzed_subroutines:
-                Func.analyze(sub)
-                idx += 1
-        print 'END: ', time.asctime(time.localtime(time.time()))
 
     def decompile(self):  # wrapper of ida_hexrays.decompile
         try:
@@ -1086,7 +1163,7 @@ class Func:
             self.cfunc_t = ida_hexrays.decompile(self.start_ea)
         except Exception as e:
             Func.decompilation_failed.append(self.start_ea)
-            print 'Decompilation Failed: ', hex(self.start_ea)
+            print 'Decompilation Failed: ', hex(self.start_ea), e
 
     def init_state(self):
         # if self.start_ea in Block.pool:
@@ -1094,157 +1171,102 @@ class Func:
         #     lvars[0].tif = ida_hexrays.create_typedef('NSConcreteStackBlock *')
         if self.start_ea in MachO.updated_func_args:
             new_func_data = MachO.updated_func_args[self.start_ea]
-            for idx in range(0, len(new_func_data)):
-                if new_func_data[idx]:
-                    self.cfunc_t.arguments[idx+2].tif = ida_hexrays.create_typedef(new_func_data[idx])
+            if len(new_func_data) != len(self.cfunc_t.arguments):
+                print 'WRONG FUNC DATA INFO', hex(self.start_ea)
+
+            for idx in range(0, len(self.cfunc_t.arguments)):
+                if idx < len(new_func_data) and new_func_data[idx]:
+                    self.cfunc_t.arguments[idx].tif = ida_hexrays.create_typedef(new_func_data[idx])
 
     def resolve_cfunc(self):
         if not self.cfunc_t:
             return
-        body = []
-        ret = []
-        for ea in self.cfunc_t.eamap:
-            if idc.GetMnem(ea) in ['BL', 'B']:
-                call = idc.GetOpnd(ea, 0)
-                if call.startswith('loc'):
-                    continue
-                if len(list(idautils.CodeRefsFrom(ea, 1))) == 1:
-                    ret.append((ea, self.cfunc_t.eamap[ea][0]))
-                else:
-                    body.append((ea, self.cfunc_t.eamap[ea][0]))
-        # cinsnptrvec_t = self.cfunc_t.eamap[ea]  # TODO CASE 2 for cinsn_t in cinsnptrvec_t
-        # cinsn = cinsnptrvec_t[0]
-        # TODO use cinsn.ea or ea ?
-        for cinsn in body:
-            self.process_cinsn_t(cinsn[0], cinsn[1])
-        for cinsn in ret:
-            self.process_cinsn_t(cinsn[0], cinsn[1])
-        self.update_funcdata_if_needed()
+        if not len(self.cfunc_t.treeitems):
+            self.cfunc_t.get_pseudocode()
 
-    def update_funcdata_if_needed(self):
-        """
-        find possible ret types, put it into self.ret, and update funcdata if needed.
-        :return:
-        """
+        for item in self.cfunc_t.treeitems:
+            op_code = item.cexpr.op
+            if op_code != 57:  # call
+                continue
+            ret_type = self.process_call(item.ea, item.cexpr)
+            if type(ret_type) is ida_hexrays.lvar_t:
+                ret_type = self.get_var_type(ret_type)
+                print 'WHY', hex(item.ea)
+            self.call_and_ret[item.ea] = ret_type
+            self.process_item(item, _type=ret_type)
+
+        for item in self.cfunc_t.treeitems:
+            op_code = item.cexpr.op
+            if op_code == 80:
+                self.process_ret(item.cexpr)
+
         for t in ['id', 'void *']:
             if t in self.ret:
                 self.ret.remove(t)
-        if self.ret:
-            pass  # have been filled during the resolve_cfunc process.(creturn_t)
-        else:
-            if self.start_ea not in MachO.funcs_need_calc:
-                # todo if self is a subroutine, the result of query may be None
-                self.ret.append(MachO.query_ori_func_data(self.start_ea))
-            # find the return using the ret cinsn
-            if not len(self.cfunc_t.treeitems):
-                self.cfunc_t.get_pseudocode()
-            for item in self.cfunc_t.treeitems:
-                if item.cinsn.op == 80 or item.cinsn.op == 83:
-                    self.process_ret(item.ea, item.cinsn.details)
 
         # update Mach-O data
-        if self.start_ea in MachO.funcs_need_calc:
+        if self.start_ea in MachO.funcs_need_calc and self.ret:
             rets = set(self.ret)
             rets.discard(None)
             if rets:
                 if len(rets) == 1:
                     pass
                 else:
-                    print 'ERROR 454, ', hex(self.start_ea),  rets
+                    print 'ERROR 454, ', hex(self.start_ea), rets
                 MachO.updated_func_ret[self.start_ea] = rets.pop()
             else:
                 pass  # failed to calc the ret type
 
-    def process_cinsn_t(self, ea, cinsn_t):
-        try:
-            if cinsn_t.op is idaapi.cit_expr:
-                self.process_expr(ea, cinsn_t.details)
-            elif cinsn_t.op is 80:  # return
-                self.process_ret(ea, cinsn_t.details)
-            elif isinstance(cinsn_t.details, ida_hexrays.ceinsn_t):  # cinsn_t.op is idaapi.cit_if, do, while...
-                self.process_ceinsn_t(ea, cinsn_t.details)
-            elif isinstance(cinsn_t.details, ida_hexrays.cgoto_t):
-                pass
-            else:  # very rare
-                print 'ERROR 2', hex(ea), cinsn_t.details
-        except Exception as e:
-            print '!!!', e, hex(ea)
-
-    def process_ret(self, ea, creturn_t):
-        self.ret_ea.append(ea)
-        cast_type, ret_type, call_expr = None, None, None
-        if creturn_t.expr.opname == 'cast':
-            cast_type = creturn_t.expr.type
-            if creturn_t.expr.x.opname == 'call':
-                call_expr = creturn_t.expr.x
-        elif creturn_t.expr.opname == 'call':  # dispatch*, do not need cast
-            call_expr = creturn_t.expr
-        elif creturn_t.expr.opname == 'var':
-            var = self.resolve_var(creturn_t.expr.v)
-            ret_type = var.tif.__str__()
-            self.ret_vars.append(var.name)
+    def process_item(self, item, _type=None):
+        p = self.cfunc_t.body.find_parent_of(item)
+        if p.op == 2:  # asg expr
+            self.process_asg(p.cexpr, _type)
+        elif p.op == 48:  # cast expr
+            cast_type = item.cexpr.type.__str__()  # struct objc_object *, id, ...
+            self.process_item(p, _type=_type or cast_type)
+        elif p.op == 80:  # return insn
+            self.process_ret(p.cexpr, _type=_type)
+        elif p.op == 72:  # cexpr
+            pass
+        elif p.op == 73:  # if
+            pass
         else:
-            # ne, add, eq, ult... TODO CASE 1
-            case_1.append(ea)
-        if call_expr and ea != INVALID_EA:
-            ret_type = self.process_call(ea, call_expr)  # TODO CASE 3
-        if ret_type:
-            self.ret.append(ret_type)
-
-    def process_ceinsn_t(self, ea, ceinsn_t):
-        if type(ceinsn_t) is ida_hexrays.cfor_t:
-            for attr in ['expr', 'init', 'step']:
-                _attr = ceinsn_t.__getattribute__(attr)
-                if type(_attr) is ida_hexrays.cexpr_t:
-                    self.find_call_fast_and_process(ea, _attr)
-        else:
-            self.find_call_fast_and_process(ea, ceinsn_t.expr)
-
-    def process_expr(self, ea, cexpr_t):
-        if cexpr_t.opname.startswith('asg'):  # asg, asgadd, asgxor ...
-            self.process_asg(ea, cexpr_t)
-        elif cexpr_t.opname == 'call':
-            self.process_call(ea, cexpr_t)
-        else:
-            print 'ERROR 3: ', hex(ea), cexpr_t.opname
-
-    def process_asg(self, ea, cexpr_t):
-        if not cexpr_t.y:
-            print 'ERROR 12, NO EXPR FOR ASG', hex(ea)
-            return
-        cast, ret_type, fast_call = None, None, None
-        if cexpr_t.y.opname == 'call':
-            ret_type = self.process_call(ea, cexpr_t.y)
-        elif cexpr_t.y.opname == 'cast':
-            cast = cexpr_t.y.type
-            if cexpr_t.y.x.opname == 'call':
-                ret_type = self.process_call(ea, cexpr_t.y.x)
+            if p.op in ERROR:
+                ERROR[p.op].append(p.ea)
             else:
-                fast_call = cexpr_t.y.x  # expr is too complicated, just find the call and ignore the assign.
-        else:
-            fast_call = cexpr_t.y.x
-        if type(fast_call) is ida_hexrays.cexpr_t:
-            self.find_call_fast_and_process(ea, fast_call)
-        # ASG
-        lvalue = cexpr_t.x
+                ERROR[p.op] = [p.ea, ]
+
+    def process_asg(self, cexpr, _type):
+        if not _type or _type in USELESS_TYPES:
+            return
+        lvalue = cexpr.x
+        rvalue = cexpr.y
         if lvalue.opname == 'var':
             lvalue = self.resolve_var(lvalue.v)
-            self.asg[ea] = [lvalue.name, ]
-            # lu = lvar_usage(lvalue.name, ea, -1)
-            # self.add_lvar_usage(lu)
-            if ret_type and 'tif' in dir(lvalue) and lvalue.tif.__str__() != ret_type:
-                # if cast != struct objc_object *, id, ...
-                ret_type = ida_hexrays.create_typedef(ret_type)
-                lvalue.tif = ret_type
-                cexpr_t.y.tif = ret_type
+            if 'tif' in dir(lvalue) and lvalue.tif.__str__() != _type:
+                lvalue.tif = ida_hexrays.create_typedef(_type)
+                rvalue.tif = ida_hexrays.create_typedef(_type)
         elif lvalue.opname == 'obj':
             if idc.SegName(lvalue.obj_ea) in ['__bss', '__common']:
-                if lvalue.obj_ea not in MachO.bss_data and ret_type:
-                    MachO.bss_data[lvalue.obj_ea] = ret_type
+                if lvalue.obj_ea not in MachO.bss_data:
+                    MachO.bss_data[lvalue.obj_ea] = _type
             else:
-                print 'TODO case 4', hex(ea)
-        elif lvalue.opname in ['memptr', 'ptr', 'idx', 'call']:
-            print 'lvalue, ', lvalue.opname, hex(ea)
+                print 'TODO case 4', hex(cexpr.ea)
+        else:
+            if lvalue.opname == 'memptr':
+                memptr.append(cexpr.ea)
+            else:
+                print 'lvalue, ', lvalue.opname, hex(cexpr.ea)
+
+    def process_ret(self, cexpr, _type=None):
+        self.ret_ea.append(cexpr.ea)
+        if _type:
+            self.ret.append(_type)
+        else:
+            if cexpr.op == 65:  # var
+                var = self.resolve_var(cexpr.v)
+                self.ret_vars.append(var.name)
+                self.ret.append(var.tif.__str__())
 
     def process_call(self, ea, cexpr_t):
         callee = None
@@ -1252,10 +1274,10 @@ class Func:
             callee = cexpr_t.x.x.obj_ea
         elif cexpr_t.x.opname == 'obj':
             callee = cexpr_t.x.obj_ea
-        elif cexpr_t.x.opname == 'helper':  # COERCE_DOUBLE(-[DecideViewController rtAngle](v2, "rtAngle"));
-            if len(cexpr_t.a) == 1 and type(cexpr_t.a[0]) is ida_hexrays.cexpr_t:
-                call = self.find_call_fast(cexpr_t.a[0])
-                return self.process_call(ea, call) if call else None
+        elif cexpr_t.x.opname == 'helper':
+            helper.append(ea)
+        elif cexpr_t.x.opname in ['ptr', 'idx']:
+            blr.append(ea)
         else:
             print 'ERROR 4: the first operand of call is : ', cexpr_t.x.opname, hex(ea)
 
@@ -1274,9 +1296,17 @@ class Func:
             target = Block.handle(ea, 'GCD', call, self.resolve_args(cexpr_t.a, 0, ea, 'GCD'), self)
         elif call in arc_calls_as_nop:
             CG.sharedCG.add_edge(self.start_ea, callee, ea, 'C', ccall=CCall(self, ea, call, args=cexpr_t.a))
-            ret_type = self.resolve_arc_val(ea, call, cexpr_t.a)
+            if cexpr_t.a:
+                ret_type = self.resolve_cexpr(cexpr_t.a[0], ea, usage='arc', ret_type=True)
+            else:
+                miss_arg[ea] = call
         elif call.startswith('loc_'):
             pass
+        elif callee in MachO.subroutines:
+            args = self.resolve_args(cexpr_t.a, 0, ea, 'sub')
+            target = Block.handle(ea, 'SUB', call, args, self)
+            MachO.update_func_data_and_analyze(callee, args, frm=ea)
+            CG.sharedCG.add_edge(self.start_ea, callee, ea, 'C', ccall=CCall(self, ea, call, args=cexpr_t.a))
         else:
             if call[0] in ['-', '+']:
                 msg = Message(self, ea, call, args=cexpr_t.a)
@@ -1290,56 +1320,67 @@ class Func:
         #     ida_xref.add_cref(ea, target, ida_xref.XREF_USER)
         return ret_type
 
-    def find_call_fast_and_process(self, ea, cexpr_t):
-        call = self.find_call_fast(cexpr_t)
-        if call:
-            self.process_call(ea, call)
+    def resolve_cexpr(self, cexpr_t, ea, usage=None, ret_type=False):
+        if cexpr_t.opname == 'cast':
+            ori_type = cexpr_t.x.type.__str__()
+            # cast_type = cexpr_t.type.__str__()
+            if ori_type not in USELESS_TYPES:
+                return ori_type
+            return self.resolve_cexpr(cexpr_t.x, ea, usage=usage, ret_type=ret_type)
+        if cexpr_t.v:
+            var = self.resolve_var(cexpr_t.v)
+            return self.get_var_type(var) if ret_type else var
+        if cexpr_t.obj_ea and cexpr_t.obj_ea != INVALID_EA:
+            return self.resolve_obj(cexpr_t.obj_ea)  # ret str or long
+        if cexpr_t.n:
+            return cexpr_t.n._value
+        if cexpr_t.opname == 'ref':
+            # (GrayCtl_meta *)&OBJC_CLASS___GrayCtl: obj
+            # &var: var
+            referenced_obj = self.resolve_cexpr(cexpr_t.x, ea, usage=usage, ret_type=ret_type)
+            return referenced_obj
+        if cexpr_t.opname == 'ptr':
+            # *(void **)(v4 + 32)；*(struct objc_object **)(a1 + 32)
+            # obj_address = self.resolve_arg(carg_t.x, ea, idx, usage=usage, ret_type=ret_type)
+            if cexpr_t.x.opname == 'cast' and cexpr_t.x.x.opname == 'add':
+                return self.resolve_block_var(cexpr_t.x.x)
+            # *((_QWORD *)v6 + 5)
+            if cexpr_t.x.opname == 'add':
+                x = self.resolve_cexpr(cexpr_t.x.x, ea, ret_type=True)
+                y = self.resolve_cexpr(cexpr_t.x.y, ea)
+                ivar = MachO.query_ivar(x, y)
+                return Utils.pprint_type(ivar) if ivar else 'id'
+            else:
+                return  #todo
+        if cexpr_t.opname == 'idx':
+            base = self.resolve_cexpr(cexpr_t.x, ea, ret_type=True)
+            offset = self.resolve_cexpr(cexpr_t.y, ea)
+            ivar = MachO.query_ivar(base, offset)
+            return Utils.pprint_type(ivar) if ivar else None
 
-    def find_call_fast(self, cexpr_t):
-        if cexpr_t.opname == 'call':
-            return cexpr_t
-        try:
-            if cexpr_t.operands:
-                for label, operand in cexpr_t.operands.items():
-                    if type(operand) is ida_hexrays.cexpr_t:
-                        call = self.find_call_fast(operand)
-                        if call:
-                            return call
-        except Exception as e:
-            print e
+        if cexpr_t.opname == 'memptr':  # (void *)v5->_locationManager
+            return cexpr_t.type.__str__()
+         # TODO CASE 5
 
-    def resolve_def(self, defea):
-        defea = defea / 4 * 4
-        if defea in self.cfunc_t.eamap:
-            def_ins = self.cfunc_t.eamap[defea][0]
-            if def_ins.op is idaapi.cit_expr and 'y' in def_ins.details.operands:
-                def_expr_y = def_ins.details.y
-                # the rvalue is ea
-                if def_expr_y and def_expr_y.opname == 'obj':
-                    return idc.get_bytes(def_expr_y.obj_ea, idc.get_item_size(def_expr_y.obj_ea) - 1)
-                # the rvalue is var
-                elif def_expr_y and def_expr_y.opname == 'var':
-                    var = self.cfunc_t.get_lvars()[def_expr_y.v.idx]
-                    var_type = var.tif.__str__()
-                    if var_type not in ['id', 'void *', 'void **', 'struct objc_object *', '__int64']:
-                        return var_type
-                    if var.defea/4*4 != defea:
-                        return self.resolve_def(var.defea)
-                # the rvalue is an expression, when using cast, the ori type may be useful.
-                elif def_expr_y and def_expr_y.opname == 'cast':
-                    ori_type = def_expr_y.x.type.__str__()
-                    if ori_type in ['void *', 'id']:  # invalid, try to find the real
-                        if def_expr_y.x.opname == 'var':
-                            ori_type = self.resolve_var(def_expr_y.x.v).tif.__str__()
-                    return ori_type
-                # the rvalue is *(struct objc_object **)(a1 + 32)
-                elif def_expr_y and def_expr_y.opname == 'ptr':
-                    if def_expr_y.x.opname == 'cast':
-                        if def_expr_y.x.x.opname == 'add':
-                            return self.resolve_block_var(def_expr_y.x.x)
-
-        else:
-            print 'ERROR 11, ', hex(defea)
+    def resolve_def(self, var, def_list=None):
+        def_list = def_list or []
+        defea = var.defea / 4 * 4
+        if defea in def_list or defea not in self.cfunc_t.eamap:
+            return
+        def_list.append(defea)
+        def_ins = self.cfunc_t.eamap[defea][0]
+        if def_ins.op is idaapi.cit_expr and 'y' in def_ins.details.operands:
+            def_expr_y = def_ins.details.y
+            rvalue = self.resolve_cexpr(def_expr_y, defea, usage='def_y')
+            if type(rvalue) is ida_hexrays.lvar_t:
+                var_type = rvalue.tif.__str__()
+                if var_type not in USELESS_TYPES:
+                    return var_type
+                return self.resolve_def(var=rvalue, def_list=def_list)
+            elif type(rvalue) in [long, int]:
+                print 'DEF ANALYSIS TEST: ', hex(defea)
+            else:
+                return rvalue
 
     def def_analysis(self, start, target_label):
         f_start = idc.get_func_attr(start, idc.FUNCATTR_START)
@@ -1357,25 +1398,35 @@ class Func:
                     if m:
                         sel = m.group('sel').replace('_', ':')
                         return sel
+                    m = re.search('.+#classRef_(?P<rec>.+)@PAGEOFF]', src)
+                    if m:
+                        rec = m.group('rec')
+                        return "{}_meta *".format(rec)
                     target = src
+            elif mnem == 'BL' and target == 'X0':
+                return self.query_ret_at_callsite(curr_ea)
             elif mnem == 'STR':
                 if idc.GetOpnd(curr_ea, 1) == target:
                     target = idc.GetOpnd(curr_ea, 0)
             curr_ea = idc.prev_head(curr_ea, f_start)
 
+    def query_ret_at_callsite(self, ea):
+        if ea in self.call_and_ret:
+            return self.call_and_ret[ea]
+        return None
+
     def resolve_var(self, var_ref_t, _type=None):
         var = self.cfunc_t.get_lvars()[var_ref_t.idx]
         Block.update_var_tif_if_needed(var, self.cfunc_t)
-        if _type == 'def_str':
-            pass
         return var
 
     def get_var_type(self, var):
+        # RETURN TYPE STR
         var_type = var.tif.__str__()
-        if var_type not in ['id', 'void *', 'void **', 'struct objc_object *', '__int64']:
+        if var_type not in USELESS_TYPES:
             return var_type
         else:
-            return self.resolve_def(var.defea)
+            return self.resolve_def(var=var) or var_type
 
     def resolve_obj(self, obj_ea):
         # ret str or long
@@ -1397,59 +1448,11 @@ class Func:
         elif segName in ['__bss', '__common']:
             return MachO.query_bss(obj_ea) or 'id'  # TODO  or return id?
 
-    def resolve_arc_val(self, ea, call, args):
-        # call is a arc call (B *, as ret)
-        if idaapi.get_func(ea).startEA not in MachO.funcs_need_calc or not args:
-            return  #
-        # if len(args) != 1:  we should reset the func's type
-        val = self.resolve_arg(args[0], ea, 0, usage='arc')
-        if type(val) is str:
-            return val
-        elif type(val) is ida_hexrays.lvar_t:
-            return self.get_var_type(val)
-        else:
-            print 'ERROR 345, ', hex(ea)
-            return None
-
     def resolve_args(self, args, start, callsite, type):
         ret = []
         for idx in range(start, len(args)):
-            ret.append(self.resolve_arg(args[idx], callsite, idx, type))
+            ret.append(self.resolve_cexpr(args[idx], callsite, type))
         return ret
-
-    def resolve_arg(self, carg_t, ea, idx, usage=None):
-        if carg_t.v:
-            return self.resolve_var(carg_t.v)
-            # return self.get_var_type(carg_t.v)
-        if carg_t.obj_ea and carg_t.obj_ea != INVALID_EA:
-            return self.resolve_obj(carg_t.obj_ea)  # ret str or long
-        if carg_t.n:
-            return carg_t.n._value
-        # if carg_t.opname == 'ptr':
-        #     ptr_arg.append([ea, idx])
-        #     return 'id'  # TODO
-        if carg_t.x:
-            if carg_t.x.opname == 'obj':  # &OBJC_CLASS___NSNumber
-                return self.resolve_obj(carg_t.x.obj_ea)
-            elif carg_t.x.opname == 'var':  # TODO the cast operation fron IDA may be wrong, we use the ori_var_type
-                # return self.get_var_type(carg_t.x.v)
-                return self.resolve_var(carg_t.x.v)
-            elif carg_t.x.opname == 'ptr':
-                print 'TODO 7, ', hex(ea), idx, usage
-            elif carg_t.x.opname == 'memptr':  # (void *)v5->_locationManager, carg_t.opname == 'cast'
-                return carg_t.x.type.__str__()
-
-            # ((id (__cdecl *)(GrayCtl_meta *, SEL))objc_msgSend)((GrayCtl_meta *)&OBJC_CLASS___GrayCtl, "instance");
-            # actually, the cast type is right
-            elif carg_t.x.opname == 'ref':  # &OBJC_CLASS___GrayCtl
-                if carg_t.x.x.opname == 'obj':  # OBJC_CLASS___GrayCtl
-                    return self.resolve_obj(carg_t.x.x.obj_ea)
-
-            # objc_msgSend(*(void **)(v4 + 32), "setProPriceStr:", v22);
-            elif carg_t.x.opname == 'cast' and carg_t.x.x.opname == 'add':
-                # fi = ida_funcs.get_func(ea).startEA
-                return self.resolve_block_var(carg_t.x.x)
-            # TODO CASE 5
 
     def resolve_block_var(self, cexpr):
         # cexpr.opname == 'add'
@@ -1778,6 +1781,34 @@ class NSUserdefaults:
         self.data = dict()
         NSUserdefaults.shared = self
 
+    def add_invoke(self, key, callsite, data=None):
+        _type = 'GET' if data is None else 'SET'
+        record = (callsite, data)
+        if key not in self.data:
+            self.data[key] = {'SET': [], 'GET': []}
+        self.data[key][_type].append(record)
+
+    def get_data(self, key):
+        data_types = set()
+        if key in self.data:
+            for callsite, _type in self.data[key]['SET']:
+                if _type and _type not in USELESS_TYPES:
+                    data_types.add(_type)
+        if len(list(data_types)) == 1:
+            return data_types.pop()
+
+    def pprint(self):
+        for key in self.data:
+            print 'KEY', key
+            print 'GET'
+            for record in self.data[key]['GET']:
+                print record
+            print 'SET'
+            for record in self.data[key]['SET']:
+                print record
+
+
+
 # ------------------------------Utils---------------------------------------------
 class Utils:
 
@@ -1805,6 +1836,25 @@ class Utils:
                 t = '{} *'.format(t.strip('@'))
             func_type.append(t)
         return func_type
+
+    @staticmethod
+    def find_value(src):
+        m = re.search('.+#selRef_(?P<sel>.+)@PAGEOFF]', src)
+        if m:
+            sel = m.group('sel').replace('_', ':')
+            return sel
+        m = re.search('.+#classRef_(?P<rec>.+)@PAGEOFF]', src)
+        if m:
+            rec = m.group('rec')
+            return "{}_meta *".format(rec)
+        m = re.search('.+#classRef_(?P<rec>.+)@PAGEOFF]', src)
+
+
+        # '#_OBJC_IVAR_$_AppCommunicateData._dictionaryData@PAGEOFF'
+
+    @staticmethod
+    def pprint_type(str):
+        return str.strip('@"')
 
     @staticmethod
     def log(str):
